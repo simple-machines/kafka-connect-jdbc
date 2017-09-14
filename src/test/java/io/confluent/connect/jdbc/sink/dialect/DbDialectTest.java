@@ -64,6 +64,18 @@ public class DbDialectTest {
   }
 
   @Test
+  public void getSelectKeysQuery() {
+    assertEquals(
+        "SELECT `id` FROM `customers` WHERE `id` = ?",
+        DUMMY_DIALECT.getSelectKeysQuery("customers", "id", 1)
+    );
+    assertEquals(
+        "SELECT `bob` FROM `users` WHERE `bob` IN (?, ?, ?)",
+        DUMMY_DIALECT.getSelectKeysQuery("users", "bob", 3)
+    );
+  }
+
+  @Test
   public void formatColumnValue() {
     verifyFormatColumnValue("42", Schema.INT8_SCHEMA, (byte) 42);
     verifyFormatColumnValue("42", Schema.INT16_SCHEMA, (short) 42);

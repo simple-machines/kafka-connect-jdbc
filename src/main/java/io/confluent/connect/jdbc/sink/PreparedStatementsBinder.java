@@ -30,9 +30,12 @@ import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.Collection;
 
 import io.confluent.connect.jdbc.sink.metadata.FieldsMetadata;
 import io.confluent.connect.jdbc.util.DateTimeUtils;
+
+import static io.confluent.connect.jdbc.sink.JdbcSinkConfig.PrimaryKeyMode.RECORD_KEY;
 
 public class PreparedStatementsBinder {
 
@@ -49,27 +52,66 @@ public class PreparedStatementsBinder {
     //             the relevant SQL has placeholders for keyFieldNames, in iteration order for all DELETE queries
     //             the relevant SQL has placeholders for nonKeyFieldNames first followed by keyFieldNames, in iteration order for all UPDATE queries
 
-    int index = 1;
     if (valueStruct == null && config.deleteEnabled) {
-      bindKeyFields(config.pkMode, deleteStatement, fieldsMetadata, record, index);
-      deleteStatement.addBatch();
+      bindDelete(config, deleteStatement, fieldsMetadata, record);
     } else {
       switch (config.insertMode) {
         case INSERT:
         case UPSERT:
-          index = bindKeyFields(config.pkMode, statement, fieldsMetadata, record, index);
-          bindNonKeyFields(statement, fieldsMetadata, record, valueStruct, index);
+          bindInsert(config, statement, fieldsMetadata, record);
           break;
 
         case UPDATE:
-          index = bindNonKeyFields(statement, fieldsMetadata, record, valueStruct, index);
-          bindKeyFields(config.pkMode, statement, fieldsMetadata, record, index);
+          bindUpdate(config, statement, fieldsMetadata, record);
           break;
         default:
           throw new AssertionError();
 
       }
-      statement.addBatch();
+    }
+  }
+
+  public void bindDelete(
+      JdbcSinkConfig config,
+      PreparedStatement deleteStatement,
+      FieldsMetadata fieldsMetadata,
+      SinkRecord record
+  ) throws SQLException {
+    bindKeyFields(config.pkMode, deleteStatement, fieldsMetadata, record, 1);
+    deleteStatement.addBatch();
+  }
+
+  public void bindInsert(
+      JdbcSinkConfig config,
+      PreparedStatement statement,
+      FieldsMetadata fieldsMetadata,
+      SinkRecord record
+  ) throws SQLException {
+    final Struct valueStruct = (Struct) record.value();
+    int index = bindKeyFields(config.pkMode, statement, fieldsMetadata, record, 1);
+    bindNonKeyFields(statement, fieldsMetadata, record, valueStruct, index);
+    statement.addBatch();
+  }
+
+  public void bindUpdate(
+      JdbcSinkConfig config,
+      PreparedStatement statement,
+      FieldsMetadata fieldsMetadata,
+      SinkRecord record
+  ) throws SQLException {
+    final Struct valueStruct = (Struct) record.value();
+    int index = bindNonKeyFields(statement, fieldsMetadata, record, valueStruct, 1);
+    bindKeyFields(config.pkMode, statement, fieldsMetadata, record, index);
+    statement.addBatch();
+  }
+
+  public void bindIdCheck(
+      PreparedStatement idStatement,
+      FieldsMetadata fieldsMetadata,
+      Collection<SinkRecord> records) throws SQLException {
+    int index = 1;
+    for (SinkRecord record : records) {
+      index = bindKeyFields(RECORD_KEY, idStatement, fieldsMetadata, record, index);
     }
   }
 

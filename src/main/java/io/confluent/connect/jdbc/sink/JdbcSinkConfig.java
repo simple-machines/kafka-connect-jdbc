@@ -35,6 +35,7 @@ public class JdbcSinkConfig extends AbstractConfig {
   public enum InsertMode {
     INSERT,
     UPSERT,
+    INSERT_OR_UPDATE,
     UPDATE;
 
   }
@@ -115,6 +116,8 @@ public class JdbcSinkConfig extends AbstractConfig {
       + "    Use standard SQL ``INSERT`` statements.\n"
       + "``upsert``\n"
       + "    Use the appropriate upsert semantics for the target database if it is supported by the connector, e.g. ``INSERT OR IGNORE``."
+      + "``insert_or_update``\n"
+      + "    Query if id exists before choosing insert or update. Useful if no native upsert support on DB.\n"
       + "``update``\n"
       + "    Use the appropriate update semantics for the target database if it is supported by the connector, e.g. ``UPDATE``.";
   private static final String INSERT_MODE_DISPLAY = "Insert Mode";

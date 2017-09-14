@@ -16,24 +16,34 @@
 
 package io.confluent.connect.jdbc.sink;
 
+import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.sql.BatchUpdateException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import io.confluent.connect.jdbc.sink.dialect.DbDialect;
 import io.confluent.connect.jdbc.sink.metadata.FieldsMetadata;
 
 import static io.confluent.connect.jdbc.sink.JdbcSinkConfig.InsertMode.INSERT;
+import static io.confluent.connect.jdbc.sink.JdbcSinkConfig.InsertMode.INSERT_OR_UPDATE;
 
 public class BufferedRecords {
   private static final Logger log = LoggerFactory.getLogger(BufferedRecords.class);
@@ -49,6 +59,7 @@ public class BufferedRecords {
   private Schema valueSchema;
   private FieldsMetadata fieldsMetadata;
   private PreparedStatement updatePreparedStatement;
+  private PreparedStatement altUpdatePreparedStatement;
   private PreparedStatement deletePreparedStatement;
   private PreparedStatementsBinder preparedStatementsBinder;
 
@@ -83,15 +94,10 @@ public class BufferedRecords {
       // re-initialize everything that depends on the record schema
       fieldsMetadata = FieldsMetadata.extract(tableName, config.pkMode, config.pkFields, config.fieldsWhitelist, record.keySchema(), record.valueSchema());
       dbStructure.createOrAmendIfNecessary(config, connection, tableName, fieldsMetadata);
-      final String insertSql = getInsertSql();
-      final String deleteSql = getDeleteSql();
-      log.debug("{} sql: {} deleteSql: {} meta: {}", config.insertMode, insertSql, deleteSql, fieldsMetadata);
       close();
-      updatePreparedStatement = connection.prepareStatement(insertSql);
-      if (config.deleteEnabled && deleteSql != null) {
-        deletePreparedStatement = connection.prepareStatement(deleteSql);
-      }
+      configurePreparedStatements();
     }
+
     records.add(record);
     if (records.size() >= config.batchSize) {
       flushed.addAll(flush());
@@ -100,20 +106,31 @@ public class BufferedRecords {
   }
 
   public List<SinkRecord> flush() throws SQLException {
+    if (config.insertMode == INSERT_OR_UPDATE) {
+      return insertOrUpdateFlush();
+    }
     if (records.isEmpty()) {
       return new ArrayList<>();
     }
     for (SinkRecord record : records) {
+      log.info("Writing {}", record);
       preparedStatementsBinder.bindRecord(config, updatePreparedStatement, deletePreparedStatement, fieldsMetadata, record);
     }
     int totalUpdateCount = 0;
     boolean successNoInfo = false;
-    for (int updateCount : updatePreparedStatement.executeBatch()) {
-      if (updateCount == Statement.SUCCESS_NO_INFO) {
-        successNoInfo = true;
-      } else {
-        totalUpdateCount += updateCount;
+    try {
+      for (int updateCount : updatePreparedStatement.executeBatch()) {
+        if (updateCount == Statement.SUCCESS_NO_INFO) {
+          successNoInfo = true;
+        } else {
+          totalUpdateCount += updateCount;
+        }
       }
+    } catch (BatchUpdateException bue) {
+      String updateCounts = Arrays.toString(bue.getUpdateCounts());
+      log.error("Batch failed updateCounts:{} message: {}",
+          updateCounts, bue.getMessage());
+      throw bue;
     }
     int totalDeleteCount = 0;
     if (deletePreparedStatement != null) {
@@ -152,10 +169,87 @@ public class BufferedRecords {
     return count;
   }
 
+
+  /**
+   * For databases such as Greenplum that don't have native support for upserts, this provides an
+   * alternative slightly less efficient and non-atomic method to support the concept.
+   * This approach also assumes that the last update for any key is the only one that matters.
+   * In other words updates contain the full current state not just the field(s) that changed.
+   *
+   * We're also only supporting non-composite primary keys for now too to simplify the logic.
+   *
+   * @return list of records applied to target DB
+   * @throws SQLException
+   */
+  private List<SinkRecord> insertOrUpdateFlush() throws SQLException {
+    if (records.isEmpty()) {
+      return new ArrayList<>();
+    }
+
+    // we only care about the latest record for each key.
+    Map<Object, SinkRecord> latestRecords = new HashMap<>();
+    String keyField = fieldsMetadata.keyFieldNames.iterator().next();
+    for (SinkRecord record : records) {
+      latestRecords.put(primaryKey(record, keyField), record);
+    }
+    String idQuery = dbDialect.getSelectKeysQuery(tableName, keyField, latestRecords.size());
+    PreparedStatement idStatement = connection.prepareStatement(idQuery);
+    preparedStatementsBinder.bindIdCheck(idStatement, fieldsMetadata, latestRecords.values());
+    Set<Object> existingKeys = existingKeys(idStatement);
+    for (Map.Entry<Object, SinkRecord> entry : latestRecords.entrySet()) {
+      if (entry.getValue().value() == null) {
+        if (existingKeys.contains(entry.getKey())) {
+          log.debug("Queueing {} for delete", entry.getKey());
+          preparedStatementsBinder.bindDelete(config, deletePreparedStatement, fieldsMetadata, entry.getValue());
+        } else {
+          log.debug("Skipping delete of unknown record {}", entry.getKey());
+        }
+      } else {
+        if (existingKeys.contains(entry.getKey())) {
+          log.debug("Queueing {} for update", entry.getKey());
+          preparedStatementsBinder.bindUpdate(config, altUpdatePreparedStatement, fieldsMetadata, entry.getValue());
+        } else {
+          log.debug("Queueing {} for insert", entry.getKey());
+          preparedStatementsBinder.bindInsert(config, updatePreparedStatement, fieldsMetadata, entry.getValue());
+        }
+      }
+    }
+
+    updatePreparedStatement.executeBatch();
+    altUpdatePreparedStatement.executeBatch();
+    deletePreparedStatement.executeBatch();
+
+    final List<SinkRecord> flushedRecords = records;
+    records = new ArrayList<>();
+    return flushedRecords;
+  }
+
+  private Object primaryKey(SinkRecord record, String keyField) {
+    assert fieldsMetadata.keyFieldNames.size() == 1;
+    if (record.keySchema().type().isPrimitive()) {
+      return record.key();
+    }
+    final Field field = record.keySchema().field(keyField);
+    return ((Struct) record.key()).get(field);
+  }
+
+  private Set<Object> existingKeys(PreparedStatement idStatement) throws SQLException {
+    Set<Object> keys = new HashSet<>();
+    ResultSet resultSet = idStatement.executeQuery();
+    while (resultSet.next()) {
+      keys.add(resultSet.getObject(1));
+    }
+    return keys;
+  }
+
   public void close() throws SQLException {
     if (updatePreparedStatement != null) {
       updatePreparedStatement.close();
       updatePreparedStatement = null;
+    }
+    if (altUpdatePreparedStatement != null) {
+      altUpdatePreparedStatement.close();
+      altUpdatePreparedStatement = null;
     }
     if (deletePreparedStatement != null) {
       deletePreparedStatement.close();
@@ -163,9 +257,29 @@ public class BufferedRecords {
     }
   }
 
-  private String getInsertSql() {
+  private void configurePreparedStatements() throws SQLException {
+    final String updateSql = getUpdateSql();
+    final String deleteSql = getDeleteSql();
+    updatePreparedStatement = connection.prepareStatement(updateSql);
+    if (config.deleteEnabled && deleteSql != null) {
+      deletePreparedStatement = connection.prepareStatement(deleteSql);
+    } else {
+      deletePreparedStatement = null;
+    }
+    if (config.insertMode == INSERT_OR_UPDATE) {
+      String altUpdate = dbDialect.getUpdate(tableName, fieldsMetadata.keyFieldNames, fieldsMetadata.nonKeyFieldNames);
+      altUpdatePreparedStatement = connection.prepareStatement(altUpdate);
+      log.debug("{} sql: {} altSql: {} deleteSql: {}", config.insertMode, updateSql, altUpdate, deleteSql);
+    } else {
+      altUpdatePreparedStatement = null;
+      log.debug("{} sql: {} deleteSql: {}", config.insertMode, updateSql, deleteSql);
+    }
+  }
+
+  private String getUpdateSql() {
     switch (config.insertMode) {
       case INSERT:
+      case INSERT_OR_UPDATE:
         return dbDialect.getInsert(tableName, fieldsMetadata.keyFieldNames, fieldsMetadata.nonKeyFieldNames);
       case UPSERT:
         if (fieldsMetadata.keyFieldNames.isEmpty()) {

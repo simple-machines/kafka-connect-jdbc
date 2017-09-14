@@ -104,6 +104,29 @@ public abstract class DbDialect {
     throw new UnsupportedOperationException();
   }
 
+  public String getSelectKeysQuery(final String tableName, final String keyColumn, final int keyCount) {
+    StringBuilder builder = new StringBuilder("SELECT ");
+    builder.append(escaped(keyColumn));
+    builder.append(" FROM ");
+    builder.append(escaped(tableName));
+    builder.append(" WHERE ");
+    builder.append(escaped(keyColumn));
+    if (keyCount == 1) {
+      builder.append(" = ?");
+
+    } else {
+      builder.append(" IN (");
+      for (int i = 1; i <= keyCount; i++) {
+        builder.append('?');
+        if (i < keyCount) {
+          builder.append(", ");
+        }
+      }
+      builder.append(')');
+    }
+    return builder.toString();
+  }
+
   public String getCreateQuery(String tableName, Collection<SinkRecordField> fields) {
     final List<String> pkFieldNames = extractPrimaryKeyFieldNames(fields);
     final StringBuilder builder = new StringBuilder();
