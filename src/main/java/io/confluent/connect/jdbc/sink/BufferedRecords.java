@@ -113,7 +113,7 @@ public class BufferedRecords {
       return new ArrayList<>();
     }
     for (SinkRecord record : records) {
-      log.info("Writing {}", record);
+      log.trace("Writing {}", record);
       preparedStatementsBinder.bindRecord(config, updatePreparedStatement, deletePreparedStatement, fieldsMetadata, record);
     }
     int totalUpdateCount = 0;
